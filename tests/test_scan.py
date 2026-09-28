@@ -181,6 +181,32 @@ def test_dry_run_makes_no_jev_calls(sample_repo: Path) -> None:
     assert all("action" not in candidate for candidate in report["candidates"])
 
 
+def test_dry_run_with_out_writes_a_pack(sample_repo: Path, tmp_path: Path) -> None:
+    out = tmp_path / "drypack"
+    request = ScanRequest.from_dict(
+        {
+            "repo": str(sample_repo),
+            "names": ["old_gate"],
+            "description": "x",
+            "dry_run": True,
+            "out": str(out),
+        }
+    )
+    report = run_scan(request, None)
+    assert (out / "report.json").is_file()
+    saved = json.loads((out / "report.json").read_text())
+    assert saved["dry_run"] is True
+    assert report["counts"]["total"] > 0
+    # A dry-run pack has report.json only: no live artifacts to mistake for a real run.
+    assert not (out / "manifest.json").exists()
+    # A retry replays the saved dry run and marks it.
+    replay = run_scan(ScanRequest.from_dict(
+        {"repo": str(sample_repo), "names": ["old_gate"], "description": "x",
+         "dry_run": True, "out": str(out)}
+    ), None)
+    assert replay["already_run"] is True
+
+
 def test_retry_with_same_out_dir_is_idempotent(sample_repo: Path, tmp_path: Path) -> None:
     out = tmp_path / "pack"
     request_dict = {

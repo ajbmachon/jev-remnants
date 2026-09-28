@@ -1,10 +1,7 @@
-"""The jvr command: one tool, JSON request in, JSON report out. Agent-first.
+"""The jvr command: find the residual mentions of a removed thing that bring it back.
 
-    echo '{"repo": "~/x", "names": ["oldGate"], "description": "..."}' | jvr scan
-
-Every parameter has a default except repo, names and description. The report goes
-to stdout as one JSON document; with "out" it is also written as a pack
-(report.json, report.md, manifest.json). `jvr schema` prints the request schema.
+Code collects and ranks every mention; Jev answers two closed questions per mention;
+code applies the action policy. JSON request in, JSON report out.
 """
 
 from __future__ import annotations
@@ -106,7 +103,17 @@ def _live_judge(request: ScanRequest, thresholds: Thresholds, journal) -> Judge:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="jvr", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="jvr",
+        description="Find the residual mentions of a removed thing that bring it back.",
+        epilog=(
+            "Examples:\n"
+            '  echo \'{"repo": "~/x", "names": ["oldGate"], "description": "Removed gate"}\' | jvr scan\n'
+            "  jvr scan --help   # every parameter and its defaults\n"
+            "  jvr schema        # the request schema as JSON\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = sub.add_parser(

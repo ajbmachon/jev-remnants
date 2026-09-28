@@ -115,7 +115,7 @@ def run_scan(
     )
     if request.dry_run:
         # No Jev spend: the ranked candidates and the remainder are the whole report.
-        return {
+        report = {
             "schema_version": SCHEMA_VERSION,
             "dry_run": True,
             "repo": str(repo),
@@ -134,6 +134,8 @@ def run_scan(
                 for candidate in candidates
             ],
         }
+        return persist_or_replay(request, report)
+
     judged = judge_candidates(judge, candidates, removed, thresholds) if candidates else {
         "refers": [], "leads": []
     }
@@ -184,14 +186,19 @@ def run_scan(
         "counts": counts | {"total": len(findings)},
         "findings": findings,
     }
-    if request.out is not None:
-        pack_written = write_report(request.out, report, request.keep_request_text)
-        if not pack_written:
-            # A retry against an existing pack: report the saved run, change nothing.
-            saved = json.loads(request.out.expanduser().joinpath("report.json").read_text())
-            saved["already_run"] = True
-            return saved
-    return report
+    return persist_or_replay(request, report)
+
+
+def persist_or_replay(request: ScanRequest, report: dict) -> dict:
+    """Write the pack once; a retry against an existing pack reports the saved run."""
+    if request.out is None:
+        return report
+    pack_written = write_report(request.out, report, request.keep_request_text)
+    if pack_written:
+        return report
+    saved = json.loads(request.out.expanduser().joinpath("report.json").read_text())
+    saved["already_run"] = True
+    return saved
 
 
 def write_report(out: Path, report: dict, keep_request_text: bool = False) -> bool:
@@ -204,33 +211,55 @@ def write_report(out: Path, report: dict, keep_request_text: bool = False) -> bo
     if pack_existed:
         return False
     (out / "report.md").write_text(markdown_report(report))
-    (out / "manifest.json").write_text(
-        json.dumps(
-            {
-                "tool": "jev-remnants",
-                "schema_version": SCHEMA_VERSION,
-                "commit": report["commit"],
-                "question_ids": report["question_ids"],
-                "counts": report["counts"],
-                "model_calls": report["budget"]["calls"],
-            },
-            indent=2,
+    if not report.get("dry_run"):
+        (out / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "tool": "jev-remnants",
+                    "schema_version": SCHEMA_VERSION,
+                    "commit": report["commit"],
+                    "question_ids": report.get("question_ids", {}),
+                    "counts": report.get("counts", {}),
+                    "model_calls": report.get("budget", {}).get("calls"),
+                },
+                indent=2,
+            )
+            + "\n"
         )
-        + "\n"
-    )
     return True
 
 
 def markdown_report(report: dict) -> str:
+    calls = report.get("budget", {}).get("calls")
+    calls_text = "dry run, no Jev calls" if calls is None else f"{calls} Jev calls"
     lines = [
         f"# Residual mentions: {', '.join(report['removed']['names'])}",
         "",
         f"Repository `{report['repo']}` at `{report['commit'][:12]}`; "
-        f"{report['counts']['total']} mentions, {report['budget']['calls']} Jev calls.",
+        f"{report['counts']['total']} mentions, {calls_text}.",
         "",
         "| Action | Count |",
         "|---|---|",
     ]
+    if report.get("dry_run"):
+        lines += [
+            "",
+            "## Candidates (dry run, not judged)",
+            "",
+        ]
+        lines += [
+            f"- `{candidate['location']}` ({candidate['kind']}"
+            + (f", {candidate['comment_kind']}" if candidate["comment_kind"] else "")
+            + f"): {candidate['mention'].splitlines()[0] if candidate['mention'] else ''}"
+            for candidate in report.get("candidates", [])
+        ]
+        if report.get("budget", {}).get("not_inspected"):
+            lines += ["", "## Not inspected", ""]
+            lines += [
+                f"- `{entry['file']}:{entry['line']}` ({entry['reason']})"
+                for entry in report["budget"]["not_inspected"]
+            ]
+        return "\n".join(lines) + "\n"
     for action in ("resurrection", "fix_reference", "review", "historical", "unrelated"):
         if report["counts"].get(action):
             lines.append(f"| {action} | {report['counts'][action]} |")
