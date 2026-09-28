@@ -1,0 +1,30 @@
+[project]
+name = "jev-remnants"
+version = "0.1.0"
+description = "Find the mentions of a removed function, feature or banned pattern that bring it back. Code collects and decides; Jev judges meaning."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "jev-navigator[typesafe]",
+]
+
+[project.scripts]
+jvr = "jev_remnants.cli:main"
+
+[tool.uv.sources]
+jev-navigator = { path = "../jev-navigator", editable = true }
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "N"]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12"]
+build-backend = "uv_build"
