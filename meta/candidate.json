@@ -1,0 +1,60 @@
+{
+  "case_id": "jvr-residual-mentions-v1",
+  "group_id": "removal-durability",
+  "revision_id": "questions-v1",
+  "request": {
+    "model": "jev-latest",
+    "state": {
+      "removed": {
+        "names": ["old_gate"],
+        "description": "A removed order-limit check that failed carts above ten items."
+      },
+      "mention": {
+        "location": "AGENTS.md:3",
+        "text": "3: # Rules\n4: \n5: NEVER remove the old_gate check; orders above ten items must fail.\n6: \n7: ## Review checklist\n8: - every cart goes through validation before payment"
+      }
+    },
+    "questions": {
+      "refers_to_removed": {
+        "type": "noul",
+        "instructions": {
+          "question": "Does the text in `mention.text` refer to the removed thing described in `removed`?",
+          "inspect": ["removed.names", "removed.description", "mention.text"]
+        },
+        "criteria": {
+          "true": {
+            "what": "The mention is about the removed thing itself: it uses one of the names in `removed.names`, or describes behavior, configuration or interfaces the removed thing had, as described in `removed.description`.",
+            "not_for": "A different thing that happens to share a word with a name, such as an unrelated function of the same name in another module."
+          },
+          "false": {
+            "what": "The mention is about something else entirely, and none of the names in `removed.names` appears as a name of the removed thing in the text."
+          }
+        }
+      },
+      "leads_agent_to_recreate": {
+        "type": "noul",
+        "instructions": {
+          "question": "Would an agent reading `mention.text` be led to use, call, configure or re-create the removed thing described in `removed`?",
+          "inspect": ["removed.description", "mention.text"]
+        },
+        "criteria": {
+          "true": {
+            "what": "The mention instructs use: it shows how to call or configure the thing, presents it as current or recommended, gives an example to copy, asserts a behavior of it, or is a test that exercises it."
+          },
+          "false": {
+            "what": "The mention only records history or absence: a changelog entry, a migration or deprecation note, a decision record, or prose that says the thing is gone.",
+            "not_for": "Prose that presents the thing as usable, even inside a document that also mentions its removal."
+          }
+        }
+      }
+    }
+  },
+  "intended_uses": {
+    "refers_to_removed": "Separate the removed thing's real mentions from same-word different-thing matches, so the caller only acts on real residues.",
+    "leads_agent_to_recreate": "Rank which real mentions would make an agent bring the removed thing back, versus harmless historical prose."
+  },
+  "workflow": {
+    "purpose": "After a function, feature or banned pattern is removed, find every residual mention in the repository that could resurrect it; the calling agent fixes or reviews the flagged mentions.",
+    "consumer_code": "if refers.verdict == YES and kind in (agent_docs, test) and leads.verdict == YES: action = 'resurrection'; elif refers.verdict == YES and kind in (source, comment): action = 'fix_reference'; elif refers.verdict == YES: action = 'historical'; elif refers.verdict == NO: action = 'unrelated'; else: action = 'review'  # unsure stays visible, never silently dropped"
+  }
+}
