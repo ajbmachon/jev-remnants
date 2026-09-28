@@ -35,12 +35,25 @@ REQUEST_SCHEMA = {
             "type": "string",
             "description": "What the removed thing was and what it did, in one or two sentences.",
         },
+        "spec_terms": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Phrases that mark spec or doc prose as a candidate even without a name, "
+                'for example "orders above ten items".'
+            ),
+        },
         "prefixes": {"type": "array", "items": {"type": "string"}, "default": []},
         "max_candidates": {"type": "integer", "default": 200},
         "context_radius": {"type": "integer", "default": 8},
         "max_context_chars": {"type": "integer", "default": 4000},
-        "out": {"type": "string", "description": "Directory for the evidence pack; must be new."},
+        "out": {"type": "string", "description": "Directory for the evidence pack."},
         "keep_request_text": {"type": "boolean", "default": False},
+        "dry_run": {
+            "type": "boolean",
+            "default": False,
+            "description": "Collect and rank only, no Jev calls; the candidate list is the report.",
+        },
         "thresholds": {
             "type": "object",
             "properties": {
@@ -51,6 +64,21 @@ REQUEST_SCHEMA = {
         },
     },
 }
+
+EXAMPLE_REQUEST = {
+    "repo": "~/Projects/my-repo",
+    "names": ["old_gate"],
+    "description": "A removed order-limit check that failed carts above ten items.",
+}
+
+SCAN_EXAMPLES = (
+    "Examples:\n"
+    '  echo \'{"repo": "~/x", "names": ["oldGate"], "description": "Removed gate"}\' | jvr scan\n'
+    "  jvr scan request.json\n"
+    '  jvr scan \'{"repo": "~/x", "names": ["oldGate"], "description": "d", "dry_run": true}\'\n'
+    '  jvr scan \'{"repo": "~/x", "names": ["oldGate"], "description": "d", "out": "~/pack"}\'\n'
+    "  jvr schema   # every parameter with its default\n"
+)
 
 
 def _load_typesafe_environment(environment: dict[str, str]) -> None:
@@ -80,9 +108,24 @@ def _live_judge(request: ScanRequest, thresholds: Thresholds, journal) -> Judge:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="jvr", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("schema", help="print the request schema as JSON")
-    scan_parser = sub.add_parser("scan", help="scan a repository for residual mentions")
-    scan_parser.add_argument("request", nargs="?", help="request JSON; stdin when omitted")
+
+    scan_parser = sub.add_parser(
+        "scan",
+        help="scan a repository for residual mentions of a removed thing",
+        epilog=SCAN_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    scan_parser.add_argument(
+        "request", nargs="?", help="request JSON, or a path to a .json file; stdin when omitted"
+    )
+
+    sub.add_parser(
+        "schema",
+        help="print the request schema as JSON",
+        epilog="Examples:\n  jvr schema\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "schema":
@@ -101,14 +144,24 @@ def main(argv: list[str] | None = None) -> int:
             {key: float(value) for key, value in overrides.items()}
         )
     except (ValueError, KeyError, TypeError) as error:
-        print(json.dumps({"error": f"bad request: {error}"}), file=sys.stderr)
+        print(
+            json.dumps(
+                {
+                    "error": f"bad request: {error}",
+                    "example": EXAMPLE_REQUEST,
+                    "hint": "jvr schema prints every parameter with its default",
+                }
+            ),
+            file=sys.stderr,
+        )
         return 2
 
     journal = None
     if request.out is not None:
         journal = JsonlJournal(request.out / "journal.jsonl", keep_request_text=request.keep_request_text)
     try:
-        judge = _live_judge(request, thresholds, journal)
+        # A dry run never touches the provider, so it needs no API key.
+        judge = None if request.dry_run else _live_judge(request, thresholds, journal)
         report = run_scan(request, judge, thresholds)
     except Exception as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)

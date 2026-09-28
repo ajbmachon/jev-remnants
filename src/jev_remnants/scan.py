@@ -29,12 +29,14 @@ class ScanRequest:
     repo: Path
     names: tuple[str, ...]
     description: str
+    spec_terms: tuple[str, ...]
     prefixes: tuple[str, ...]
     max_candidates: int
     context_radius: int
     max_context_chars: int
     out: Path | None
     keep_request_text: bool
+    dry_run: bool
 
     @classmethod
     def from_dict(cls, data: dict) -> ScanRequest:
@@ -52,12 +54,14 @@ class ScanRequest:
             repo=repo,
             names=names,
             description=description,
+            spec_terms=tuple(data.get("spec_terms") or ()),
             prefixes=tuple(data.get("prefixes") or ()),
             max_candidates=int(data.get("max_candidates", 200)),
             context_radius=int(data.get("context_radius", 8)),
             max_context_chars=int(data.get("max_context_chars", 4000)),
             out=Path(data["out"]).expanduser() if data.get("out") else None,
             keep_request_text=bool(data.get("keep_request_text", False)),
+            dry_run=bool(data.get("dry_run", False)),
         )
 
 
@@ -92,9 +96,9 @@ def decide(refers: NoulVerdict, leads: NoulVerdict, kind: str) -> tuple[str, lis
 
 
 def run_scan(
-    request: ScanRequest, judge: Judge, thresholds: Thresholds | None = None
+    request: ScanRequest, judge: Judge | None, thresholds: Thresholds | None = None
 ) -> dict:
-    thresholds = thresholds or judge.thresholds
+    thresholds = thresholds or (judge.thresholds if judge else Thresholds())
     repo = request.repo
     if not (repo / ".git").exists():
         raise RuntimeError(f"{repo} is not a git repository")
@@ -103,11 +107,33 @@ def run_scan(
     candidates, remainder = collect_candidates(
         repo,
         request.names,
+        spec_terms=request.spec_terms,
         prefixes=request.prefixes,
         context_radius=request.context_radius,
         max_context_chars=request.max_context_chars,
         max_candidates=request.max_candidates,
     )
+    if request.dry_run:
+        # No Jev spend: the ranked candidates and the remainder are the whole report.
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "dry_run": True,
+            "repo": str(repo),
+            "commit": commit,
+            "removed": removed,
+            "budget": {"max_candidates": request.max_candidates, "not_inspected": remainder},
+            "counts": {"total": len(candidates)},
+            "candidates": [
+                {
+                    "location": f"{candidate.file}:{candidate.line}",
+                    "kind": candidate.kind,
+                    "comment_kind": candidate.comment_kind,
+                    "mention": candidate.text,
+                    "has_attached_code": bool(candidate.attached_code),
+                }
+                for candidate in candidates
+            ],
+        }
     judged = judge_candidates(judge, candidates, removed, thresholds) if candidates else {
         "refers": [], "leads": []
     }
@@ -144,8 +170,8 @@ def run_scan(
         "budget": {
             "max_candidates": request.max_candidates,
             "not_inspected": remainder,
-            "calls": judge.calls,
-            "input_tokens": judge.input_tokens,
+            "calls": judge.calls if judge else None,
+            "input_tokens": judge.input_tokens if judge else None,
         },
         "question_ids": {
             "refers_to_removed": REFERS_REMOVED.question_id,
@@ -159,14 +185,24 @@ def run_scan(
         "findings": findings,
     }
     if request.out is not None:
-        write_report(request.out, report, request.keep_request_text)
+        pack_written = write_report(request.out, report, request.keep_request_text)
+        if not pack_written:
+            # A retry against an existing pack: report the saved run, change nothing.
+            saved = json.loads(request.out.expanduser().joinpath("report.json").read_text())
+            saved["already_run"] = True
+            return saved
     return report
 
 
-def write_report(out: Path, report: dict, keep_request_text: bool) -> None:
+def write_report(out: Path, report: dict, keep_request_text: bool = False) -> bool:
+    """Write the pack once. Returns False when the pack already existed: a retry then
+    leaves it untouched, and the caller reports the saved run instead of duplicating."""
     out = out.expanduser()
-    out.mkdir(parents=True, exist_ok=False)
+    pack_existed = out.exists()
+    out.mkdir(parents=True, exist_ok=True)
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    if pack_existed:
+        return False
     (out / "report.md").write_text(markdown_report(report))
     (out / "manifest.json").write_text(
         json.dumps(
@@ -182,6 +218,7 @@ def write_report(out: Path, report: dict, keep_request_text: bool) -> None:
         )
         + "\n"
     )
+    return True
 
 
 def markdown_report(report: dict) -> str:

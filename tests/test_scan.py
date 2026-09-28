@@ -129,3 +129,73 @@ def test_question_ids_are_pinned() -> None:
 
     assert REFERS_REMOVED.question_id.startswith("refers_to_removed@")
     assert LEADS_RECREATION.question_id.startswith("leads_agent_to_recreate@")
+
+
+def test_docstring_mention_is_collected_with_attached_code(sample_repo: Path) -> None:
+    from jev_remnants.collect import collect_candidates
+
+    (sample_repo / "src" / "cart.py").write_text(
+        'def add_item(cart):\n'
+        '    """Add an item; the old_gate limit of ten no longer applies."""\n'
+        '    cart.append(1)\n'
+        '    return cart\n'
+    )
+    subprocess.run(["git", "add", "."], cwd=sample_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "docstring"], cwd=sample_repo, check=True)
+    candidates, remainder = collect_candidates(sample_repo, ("old_gate",))
+    docstring = [
+        candidate
+        for candidate in candidates
+        if candidate.file == "src/cart.py" and candidate.comment_kind == "docstring"
+    ]
+    assert docstring, "the docstring mention must be a candidate"
+    assert docstring[0].kind == "comment"
+    assert "def add_item" in docstring[0].attached_code
+    assert not remainder
+
+
+def test_spec_terms_find_unnamed_prose(sample_repo: Path) -> None:
+    from jev_remnants.collect import collect_candidates
+
+    candidates, _ = collect_candidates(
+        sample_repo, ("old_gate",), spec_terms=("orders above ten items",)
+    )
+    locations = [f"{c.file}:{c.line}" for c in candidates]
+    assert "AGENTS.md:3" in locations, "spec prose without the name must be a candidate"
+
+
+def test_dry_run_makes_no_jev_calls(sample_repo: Path) -> None:
+    request = ScanRequest.from_dict(
+        {
+            "repo": str(sample_repo),
+            "names": ["old_gate"],
+            "description": "x",
+            "dry_run": True,
+        }
+    )
+    judge = scripted_judge({"refers": 0.9, "leads": 0.9})
+    report = run_scan(request, judge)
+    assert report["dry_run"] is True
+    assert report["budget"].get("calls") is None
+    assert report["counts"]["total"] > 0
+    assert all("action" not in candidate for candidate in report["candidates"])
+
+
+def test_retry_with_same_out_dir_is_idempotent(sample_repo: Path, tmp_path: Path) -> None:
+    out = tmp_path / "pack"
+    request_dict = {
+        "repo": str(sample_repo),
+        "names": ["old_gate"],
+        "description": "x",
+        "out": str(out),
+    }
+    judge = scripted_judge({"refers": 0.9, "leads": 0.9})
+    first = run_scan(ScanRequest.from_dict(request_dict), judge)
+    second = run_scan(ScanRequest.from_dict(request_dict), judge)
+    assert first["counts"] == second["counts"]
+    assert second["already_run"] is True
+    # The retry changed nothing: the pack still holds exactly the first run.
+    report_documents = (out / "report.json").read_text().count('"schema_version"')
+    assert report_documents == 1
+    assert (out / "report.md").is_file()
+    assert (out / "manifest.json").is_file()
