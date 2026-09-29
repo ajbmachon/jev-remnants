@@ -79,26 +79,17 @@ SCAN_EXAMPLES = (
 
 
 def _load_typesafe_environment(environment: dict[str, str]) -> None:
-    """Same contract as jvn: explicit process values win, else ~/.config/jvn/env."""
-    path = Path("~/.config/jvn/env").expanduser()
-    if path.is_file():
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, _, value = line.partition("=")
-            name, value = name.strip(), value.strip().strip('"').strip("'")
-            if not environment.get(name, "").strip():
-                environment[name] = value
-    if not environment.get("TYPESAFE_API_KEY", "").strip():
-        raise RuntimeError("TYPESAFE_API_KEY is unset and ~/.config/jvn/env does not provide it")
+    """The family chain: process values win, then the checkout `.env`, then `~/.config/jvn/env`."""
+    from .environment import load_typesafe_environment
+
+    load_typesafe_environment(environment)
 
 
 def _live_judge(request: ScanRequest, thresholds: Thresholds, journal) -> Judge:
     from jev_navigator.adapters.typesafe import TypeSafeJevClient
 
     _load_typesafe_environment(dict(os.environ))
-    client = TypeSafeJevClient()
+    client = TypeSafeJevClient()  # model=None resolves TYPESAFE_DEFAULT_MODEL in the adapter
     return Judge(client, thresholds=thresholds, journal=journal)
 
 
