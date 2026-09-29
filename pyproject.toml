@@ -6,14 +6,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "jev-navigator[typesafe]",
+    "jev-navigator[typesafe] @ git+https://github.com/ajbmachon/jev-navigator",
 ]
 
 [project.scripts]
 jvr = "jev_remnants.cli:main"
-
-[tool.uv.sources]
-jev-navigator = { path = "../jev-navigator", editable = true }
 
 [dependency-groups]
 dev = ["pytest", "ruff"]
