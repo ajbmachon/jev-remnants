@@ -190,7 +190,12 @@ def run_scan(
 
 
 def persist_or_replay(request: ScanRequest, report: dict) -> dict:
-    """Write the pack once; a retry against an existing pack reports the saved run."""
+    """Write the pack once, atomically; a retry against an existing pack reports the saved run.
+
+    The report is written to a partial file and renamed into place, so a crash mid-write never
+    leaves a truncated ``report.json`` for the next run to choke on: a partial file means the
+    run never finished, and the caller sees the crash instead of silently reporting stale data.
+    """
     if request.out is None:
         return report
     pack_written = write_report(request.out, report, request.keep_request_text)
@@ -202,31 +207,42 @@ def persist_or_replay(request: ScanRequest, report: dict) -> dict:
 
 
 def write_report(out: Path, report: dict, keep_request_text: bool = False) -> bool:
-    """Write the pack once. Returns False when the pack already existed: a retry then
-    leaves it untouched, and the caller reports the saved run instead of duplicating."""
+    """Write the pack once, atomically. Returns False when the pack already existed: a retry then
+    leaves it untouched, and the caller reports the saved run instead of duplicating.
+
+    Every file lands through ``_atomic_write_json``: bytes go to ``<name>.partial`` first and a
+    rename completes the file, so a reader never sees a half-written JSON document.
+    """
     out = out.expanduser()
     pack_existed = out.exists()
     out.mkdir(parents=True, exist_ok=True)
-    (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    _atomic_write_json(out / "report.json", report)
     if pack_existed:
         return False
-    (out / "report.md").write_text(markdown_report(report))
+    _atomic_write_text(out / "report.md", markdown_report(report))
     if not report.get("dry_run"):
-        (out / "manifest.json").write_text(
-            json.dumps(
-                {
-                    "tool": "jev-remnants",
-                    "schema_version": SCHEMA_VERSION,
-                    "commit": report["commit"],
-                    "question_ids": report.get("question_ids", {}),
-                    "counts": report.get("counts", {}),
-                    "model_calls": report.get("budget", {}).get("calls"),
-                },
-                indent=2,
-            )
-            + "\n"
+        _atomic_write_json(
+            out / "manifest.json",
+            {
+                "tool": "jev-remnants",
+                "schema_version": SCHEMA_VERSION,
+                "commit": report["commit"],
+                "question_ids": report.get("question_ids", {}),
+                "counts": report.get("counts", {}),
+                "model_calls": report.get("budget", {}).get("calls"),
+            },
         )
     return True
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    _atomic_write_text(path, json.dumps(value, indent=2) + "\n")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(text)
+    partial.replace(path)
 
 
 def markdown_report(report: dict) -> str:

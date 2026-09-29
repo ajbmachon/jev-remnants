@@ -225,3 +225,22 @@ def test_retry_with_same_out_dir_is_idempotent(sample_repo: Path, tmp_path: Path
     assert report_documents == 1
     assert (out / "report.md").is_file()
     assert (out / "manifest.json").is_file()
+
+
+def test_a_truncated_pack_from_a_crash_is_healed_by_the_next_run(sample_repo: Path, tmp_path: Path) -> None:
+    """A crash mid-write leaves a truncated report.json; the next run rewrites every file
+    atomically (partial + rename), so the pack is healed whole and no `.partial` survives a
+    completed write — a reader never sees a half-written JSON document."""
+    out = tmp_path / "pack"
+    request_dict = {"repo": str(sample_repo), "names": ["old_gate"], "description": "x", "out": str(out)}
+    judge = scripted_judge({"refers": 0.9, "leads": 0.9})
+    run_scan(ScanRequest.from_dict(request_dict), judge)
+    # A completed run leaves no partials behind.
+    assert not list(out.glob("*.partial"))
+    # A crash mid-write leaves truncated JSON...
+    (out / "report.json").write_text('{"schema_version": 1, "fin')
+    # ...and the next run heals the pack atomically instead of reading or extending the torn file.
+    healed = run_scan(ScanRequest.from_dict(request_dict), judge)
+    assert "already_run" not in healed
+    assert not list(out.glob("*.partial"))
+    assert json.loads((out / "report.json").read_text())["counts"] == healed["counts"]
