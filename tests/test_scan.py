@@ -239,8 +239,10 @@ def test_a_truncated_pack_from_a_crash_is_healed_by_the_next_run(sample_repo: Pa
     assert not list(out.glob("*.partial"))
     # A crash mid-write leaves truncated JSON...
     (out / "report.json").write_text('{"schema_version": 1, "fin')
-    # ...and the next run heals the pack atomically instead of reading or extending the torn file.
+    # ...and the next run rewrites report.json atomically (healing the torn file) and reports
+    # the saved pack with already_run, as any retry does.
     healed = run_scan(ScanRequest.from_dict(request_dict), judge)
-    assert "already_run" not in healed
+    assert healed["already_run"] is True
     assert not list(out.glob("*.partial"))
-    assert json.loads((out / "report.json").read_text())["counts"] == healed["counts"]
+    healed_on_disk = json.loads((out / "report.json").read_text())
+    assert healed_on_disk["counts"] == healed["counts"]
