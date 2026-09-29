@@ -72,7 +72,8 @@ def removed_state(request: ScanRequest) -> dict:
 def judge_candidates(
     judge: Judge, candidates: list[Candidate], removed: dict, thresholds: Thresholds
 ) -> dict[str, list[CheckResult]]:
-    """Two independent judgments per candidate, batched over the same state."""
+    """Two independent judgments per candidate, each batched over all candidates. When jvn
+    releases `check_every` (both checks in one fan-out request), this becomes one pass."""
     items = [candidate.state(removed) for candidate in candidates]
     refers = judge.check_each(REFERS_REMOVED, items, thresholds=thresholds)
     leads = judge.check_each(LEADS_RECREATION, items, thresholds=thresholds)
