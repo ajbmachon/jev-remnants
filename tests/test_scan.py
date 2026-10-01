@@ -246,3 +246,112 @@ def test_a_truncated_pack_from_a_crash_is_healed_by_the_next_run(sample_repo: Pa
     assert not list(out.glob("*.partial"))
     healed_on_disk = json.loads((out / "report.json").read_text())
     assert healed_on_disk["counts"] == healed["counts"]
+
+
+class BudgetJevClient(ScriptedJevClient):
+    """Gateway stand-in: answers like ScriptedJevClient but refuses any request whose body
+    could not fit one provider request, raising the refusal shape the real gateway returns
+    (400 with error_type max_tokens_exceeded). A code-heavy body's true token count never
+    exceeds twice the SDK's len//3+1 estimate, which is what the real refusals proved.
+    """
+
+    budget_tokens = 32_768
+    refused = 0
+
+    def send(self, state, questions):
+        body = json.dumps({"state": state, "questions": questions}, sort_keys=True).encode()
+        if (len(body) // 3 + 1) * 2 > self.budget_tokens:
+            self.refused += 1
+            raise RuntimeError(
+                '400 {"detail": {"error_type": "max_tokens_exceeded", "message": '
+                '"request input budget exceeded"}, "request_id": "fake"}'
+            )
+        return super().send(state, questions)
+
+
+def budget_client() -> BudgetJevClient:
+    return BudgetJevClient(nouls={"refers_to_removed": 0.9, "leads_agent_to_recreate": 0.9})
+
+
+def test_oversized_state_fails_honestly_instead_of_killing_the_scan(sample_repo: Path) -> None:
+    # Red-before/green-after transport regression. Before the fix, a request the provider
+    # refused for input size raised through judge_candidates and killed the WHOLE scan:
+    # zero findings, exit 1, unrecoverable by retry (failed requests are not journaled for
+    # replay). The giant cart.py below reproduces the oversized-state shape (docstring plus
+    # uncapped attached_code) that the saved JVN run died on. After the fix the scan
+    # completes and every candidate is answered or honestly listed under budget.not_inspected.
+    from jev_remnants.collect import collect_candidates
+
+    (sample_repo / "src" / "cart.py").write_text(
+        "def big_cart(carts, value):\n"
+        '    """Move a cart through the depot. old_gate used to cap this at ten."""\n'
+        + "\n".join(f"    total_{i} = value_{i} + 1  # value" for i in range(4000))
+        + "\n    return carts\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=sample_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "huge"], cwd=sample_repo, check=True)
+    client = budget_client()
+    request = ScanRequest.from_dict(
+        {"repo": str(sample_repo), "names": ["old_gate"], "description": "x"}
+    )
+    report = run_scan(request, Judge(client, thresholds=Thresholds(noul_yes_at=0.8, noul_no_at=0.2)))
+    assert client.refused > 0, "the oversized requests really were refused"
+    candidates, remainder = collect_candidates(sample_repo, ("old_gate",))
+    judged = {finding["location"] for finding in report["findings"]}
+    failed = {f"{entry['file']}:{entry['line']}" for entry in report["budget"]["not_inspected"]}
+    assert not remainder, "the sample repo must stay below the candidate cap"
+    assert all(f"{c.file}:{c.line}" in judged | failed for c in candidates), (
+        "every candidate was answered or honestly listed, none silently dropped"
+    )
+    huge = next(candidate for candidate in candidates if candidate.file == "src/cart.py")
+    assert f"{huge.file}:{huge.line}" in failed, "a state that fits no request must be listed, not truncated"
+    entry = next(entry for entry in report["budget"]["not_inspected"] if entry["file"] == "src/cart.py")
+    assert "could not fit" in entry["reason"]
+    assert any(
+        finding["location"].startswith("src/main.py") for finding in report["findings"]
+    ), "candidates beside the oversized state must still be judged"
+
+
+def test_batches_over_the_provider_budget_are_bisected_not_dropped(sample_repo: Path) -> None:
+    # Red-before/green-after batch regression: with default settings a wide repo's mentions
+    # rode in a few multi-item requests of 57-140 KB, above the per-request budget, and one
+    # provider refusal killed the entire scan. The same shapes are refused offline here by
+    # the budget-enforcing client; the scan must complete and every candidate be judged.
+    from jev_remnants.collect import collect_candidates
+
+    blocks = []
+    for _ in range(120):
+        filler = "\n".join(f"    x_{j} = {j} + 1  # pad" for j in range(7))
+        blocks.append(filler + "\n# old_gate note\n")
+    (sample_repo / "src" / "wide.py").write_text(
+        "def wide(value):\n" + "\n".join(blocks) + "\n    return value\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=sample_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "wide"], cwd=sample_repo, check=True)
+    client = budget_client()
+    request = ScanRequest.from_dict(
+        {"repo": str(sample_repo), "names": ["old_gate"], "description": "x", "max_candidates": 1000}
+    )
+    report = run_scan(request, Judge(client, thresholds=Thresholds(noul_yes_at=0.8, noul_no_at=0.2)))
+    candidates, remainder = collect_candidates(sample_repo, ("old_gate",), max_candidates=1000)
+    assert client.refused > 0, "this repo must still produce over-budget requests"
+    assert report["counts"]["total"] == len(candidates), "every candidate must still be judged"
+    assert report["budget"]["not_inspected"] == list(remainder)
+
+
+def test_ordinary_runs_keep_the_unchanged_transport_shape(sample_repo: Path) -> None:
+    # Normal case: while nothing exceeds the provider budget the scan must behave exactly as
+    # before the fix -- check_each dispatched over the whole list, every candidate answered,
+    # no budget failures, unchanged request shapes (verified against the pre-fix code).
+    from jev_remnants.collect import collect_candidates
+
+    client = ScriptedJevClient(nouls={"refers_to_removed": 0.9, "leads_agent_to_recreate": 0.9})
+    request = ScanRequest.from_dict(
+        {"repo": str(sample_repo), "names": ["old_gate"], "description": "x"}
+    )
+    report = run_scan(request, Judge(client, thresholds=Thresholds(noul_yes_at=0.8, noul_no_at=0.2)))
+    candidates, remainder = collect_candidates(sample_repo, ("old_gate",))
+    assert report["counts"]["total"] == len(candidates)
+    assert report["budget"]["not_inspected"] == list(remainder)
+    assert all(finding["probabilities"]["refers_to_removed"] is not None for finding in report["findings"])
+
