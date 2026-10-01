@@ -70,15 +70,29 @@ def removed_state(request: ScanRequest) -> dict:
     return {"names": list(request.names), "description": request.description}
 
 
-_SIZE_REFUSALS = ("max_tokens_exceeded", "input budget exceeded")
+_DREX_SIZE_MESSAGES = ("Request too long: the state ", "request body must be at most ")
 
 
 def _refused_for_size(error: BaseException) -> bool:
-    """True only when a request was refused because its input could not fit (400
-    ``max_tokens_exceeded`` on the jev routes; the budget-exceeded 422 on the decider
-    routes). Auth, connection, timeout and protocol errors are not size failures."""
-    text = str(error)
-    return any(marker in text for marker in _SIZE_REFUSALS) or getattr(error, "status", None) == 422
+    """Recognize documented Jev and Drex size refusals from the SDK's decoded error body.
+
+    Status 422 also covers malformed questions and unknown models; an exception's displayed
+    message can omit Jev's error_type. Neither status alone nor an arbitrary substring is proof.
+    """
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return False
+    status = getattr(error, "status", None)
+    if status == 400:
+        detail = body.get("detail")
+        return isinstance(detail, dict) and detail.get("error_type") == "max_tokens_exceeded"
+    if status == 422:
+        detail = body.get("error")
+        if not isinstance(detail, dict) or detail.get("type") != "invalid_request_error":
+            return False
+        message = detail.get("message")
+        return isinstance(message, str) and message.startswith(_DREX_SIZE_MESSAGES)
+    return False
 
 
 def _ask_check(
@@ -98,14 +112,11 @@ def _ask_check(
     if not items:
         return [], {}
     try:
-        results = list(judge.check_each(check, items, list_name=list_name, thresholds=thresholds))
-        if len(results) == len(items):
-            return results, {}
-        failure = f"answered {len(results)} of {len(items)} items"
+        return list(judge.check_each(check, items, list_name=list_name, thresholds=thresholds)), {}
     except Exception as error:
         if not _refused_for_size(error):
             raise
-        failure = f"refused on input size: {type(error).__name__}: {str(error)[:120]}"
+        failure = f"refused on input size: {type(error).__name__}: {error}"
     if len(items) == 1:
         return [None], {0: f"could not fit one request ({failure})"}
     middle = len(items) // 2
@@ -118,16 +129,13 @@ def judge_candidates(
     judge: Judge, candidates: list[Candidate], removed: dict, thresholds: Thresholds
 ) -> dict[str, list[CheckResult | None] | dict[int, str]]:
     """Two independent judgments per candidate, each dispatched in as few requests as the
-    provider can fit (see ``_ask_check``). A candidate that no request could carry has ``None``
-    in both result lists and its reason in ``unjudged``, so the report lists it under
+    provider can fit (see ``_ask_check``). A check that no request could carry has ``None``
+    in its result slot and its reason in ``unjudged``, so the report lists the candidate under
     ``budget.not_inspected`` instead of inventing a verdict for it."""
     items = [candidate.state(removed) for candidate in candidates]
     refers, refer_gaps = _ask_check(judge, REFERS_REMOVED, items, "items", thresholds)
     leads, lead_gaps = _ask_check(judge, LEADS_RECREATION, items, "items", thresholds)
-    unjudged = {
-        index: refer_gaps.get(index) or lead_gaps.get(index) or "could not fit one request"
-        for index in set(refer_gaps) | set(lead_gaps)
-    }
+    unjudged = lead_gaps | refer_gaps
     return {"refers": refers, "leads": leads, "unjudged": unjudged}
 
 

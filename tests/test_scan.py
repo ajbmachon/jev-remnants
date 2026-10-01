@@ -7,12 +7,25 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
+import httpx2
 import pytest
+from jev_navigator.adapters.typesafe import TypeSafeJevClient
 from jev_navigator.judgments.judge import Judge
 from jev_navigator.judgments.thresholds import Thresholds
 from jev_navigator.testing import ScriptedJevClient
+from typesafe_sdk import (
+    RetryPolicy,
+    TypeSafeAPIConnectionError,
+    TypeSafeAPIResponseValidationError,
+    TypeSafeAPITimeoutError,
+    TypeSafeAuthenticationError,
+    TypeSafeBadRequestError,
+    TypeSafeClient,
+    TypeSafeUnprocessableEntityError,
+)
 
 from jev_remnants.cli import main
 from jev_remnants.scan import ScanRequest, run_scan
@@ -248,32 +261,75 @@ def test_a_truncated_pack_from_a_crash_is_healed_by_the_next_run(sample_repo: Pa
     assert healed_on_disk["counts"] == healed["counts"]
 
 
-class BudgetJevClient(ScriptedJevClient):
-    """Gateway stand-in: answers like ScriptedJevClient but refuses any request whose body
-    could not fit one provider request, raising the refusal shape the real gateway returns
-    (400 with error_type max_tokens_exceeded). A code-heavy body's true token count never
-    exceeds twice the SDK's len//3+1 estimate, which is what the real refusals proved.
+@contextmanager
+def provider_judge(handler):
+    """The real SDK and JVN adapter, with only the external HTTP provider replaced."""
+    with TypeSafeClient(
+        api_key="offline-test-key",
+        base_url="https://provider.test",
+        model="jev-latest",
+        retry=RetryPolicy(max_retries=0),
+        transport=httpx2.MockTransport(handler),
+    ) as sdk:
+        yield Judge(TypeSafeJevClient(sdk_client=sdk))
+
+
+class BudgetGateway:
+    """Refuse oversized wire bodies, returning documented provider errors through the SDK.
+
+    The byte ceiling is an independent offline fit oracle, not a model token estimate.
+    Collection, masking, SDK serialization, batching and scan recovery are all real.
     """
 
-    budget_tokens = 32_768
-    refused = 0
+    def __init__(self, status: int, refusal: dict):
+        self.status = status
+        self.refusal = refusal
+        self.refused = 0
+        self.requests = []
+        self.script = ScriptedJevClient(
+            nouls={"refers_to_removed": 0.9, "leads_agent_to_recreate": 0.9}
+        )
 
-    def send(self, state, questions):
-        body = json.dumps({"state": state, "questions": questions}, sort_keys=True).encode()
-        if (len(body) // 3 + 1) * 2 > self.budget_tokens:
+    def __call__(self, request):
+        self.requests.append(request)
+        if len(request.content) > 50_000:
             self.refused += 1
-            raise RuntimeError(
-                '400 {"detail": {"error_type": "max_tokens_exceeded", "message": '
-                '"request input budget exceeded"}, "request_id": "fake"}'
-            )
-        return super().send(state, questions)
+            return httpx2.Response(self.status, json=self.refusal)
+        body = json.loads(request.content)
+        response = self.script.send(body["state"], body["questions"])
+        return httpx2.Response(200, json=response.json())
 
 
-def budget_client() -> BudgetJevClient:
-    return BudgetJevClient(nouls={"refers_to_removed": 0.9, "leads_agent_to_recreate": 0.9})
+@pytest.fixture(params=[
+    pytest.param((400, {"detail": {"error_type": "max_tokens_exceeded"}}), id="jev-code"),
+    pytest.param((400, {"detail": {
+        "error_type": "max_tokens_exceeded", "message": "The model's input is too long."
+    }}), id="jev-code-hidden-by-message"),
+    pytest.param((422, {"error": {
+        "type": "invalid_request_error",
+        "message": "Request too long: the state exceeds the 131,072-token state limit of drex-v1.5. "
+                   "Shorten the state.",
+        "issues": [{"path": "state", "message": "exceeds the 131,072-token state limit"}],
+    }}), id="drex-state"),
+    pytest.param((422, {"error": {
+        "type": "invalid_request_error",
+        "message": "Request too long: the state plus its longest question exceed the 139,264-token "
+                   "limit of drex-v1.5. Shorten the state or that question.",
+        "issues": [{"path": "state", "message": "exceeds the 139,264-token limit"}],
+    }}), id="drex-row"),
+    pytest.param((422, {"error": {
+        "type": "invalid_request_error",
+        "message": "request body must be at most 1048576 bytes",
+        "issues": [{"path": "", "message": "request body must be at most 1048576 bytes"}],
+    }}), id="drex-body"),
+])
+def budget_gateway(request) -> BudgetGateway:
+    return BudgetGateway(*request.param)
 
 
-def test_oversized_state_fails_honestly_instead_of_killing_the_scan(sample_repo: Path) -> None:
+def test_oversized_state_fails_honestly_instead_of_killing_the_scan(
+    sample_repo: Path, budget_gateway: BudgetGateway
+) -> None:
     # Red-before/green-after transport regression. Before the fix, a request the provider
     # refused for input size raised through judge_candidates and killed the WHOLE scan:
     # zero findings, exit 1, unrecoverable by retry (failed requests are not journaled for
@@ -290,12 +346,12 @@ def test_oversized_state_fails_honestly_instead_of_killing_the_scan(sample_repo:
     )
     subprocess.run(["git", "add", "."], cwd=sample_repo, check=True)
     subprocess.run(["git", "commit", "-qm", "huge"], cwd=sample_repo, check=True)
-    client = budget_client()
     request = ScanRequest.from_dict(
         {"repo": str(sample_repo), "names": ["old_gate"], "description": "x"}
     )
-    report = run_scan(request, Judge(client, thresholds=Thresholds(noul_yes_at=0.8, noul_no_at=0.2)))
-    assert client.refused > 0, "the oversized requests really were refused"
+    with provider_judge(budget_gateway) as judge:
+        report = run_scan(request, judge)
+    assert budget_gateway.refused > 0, "the oversized requests really were refused"
     candidates, remainder = collect_candidates(sample_repo, ("old_gate",))
     judged = {finding["location"] for finding in report["findings"]}
     failed = {f"{entry['file']}:{entry['line']}" for entry in report["budget"]["not_inspected"]}
@@ -312,7 +368,9 @@ def test_oversized_state_fails_honestly_instead_of_killing_the_scan(sample_repo:
     ), "candidates beside the oversized state must still be judged"
 
 
-def test_batches_over_the_provider_budget_are_bisected_not_dropped(sample_repo: Path) -> None:
+def test_batches_over_the_provider_budget_are_bisected_not_dropped(
+    sample_repo: Path, budget_gateway: BudgetGateway
+) -> None:
     # Red-before/green-after batch regression: with default settings a wide repo's mentions
     # rode in a few multi-item requests of 57-140 KB, above the per-request budget, and one
     # provider refusal killed the entire scan. The same shapes are refused offline here by
@@ -328,15 +386,75 @@ def test_batches_over_the_provider_budget_are_bisected_not_dropped(sample_repo: 
     )
     subprocess.run(["git", "add", "."], cwd=sample_repo, check=True)
     subprocess.run(["git", "commit", "-qm", "wide"], cwd=sample_repo, check=True)
-    client = budget_client()
     request = ScanRequest.from_dict(
         {"repo": str(sample_repo), "names": ["old_gate"], "description": "x", "max_candidates": 1000}
     )
-    report = run_scan(request, Judge(client, thresholds=Thresholds(noul_yes_at=0.8, noul_no_at=0.2)))
+    with provider_judge(budget_gateway) as judge:
+        report = run_scan(request, judge)
     candidates, remainder = collect_candidates(sample_repo, ("old_gate",), max_candidates=1000)
-    assert client.refused > 0, "this repo must still produce over-budget requests"
+    assert budget_gateway.refused > 0, "this repo must still produce over-budget requests"
     assert report["counts"]["total"] == len(candidates), "every candidate must still be judged"
     assert report["budget"]["not_inspected"] == list(remainder)
+
+
+@pytest.mark.parametrize(("status", "body", "error_type", "message"), [
+    pytest.param(422, {"error": {
+        "type": "invalid_request_error",
+        "message": "questions.category.criteria: choice needs at least 1 option",
+        "issues": [{"path": "questions.category.criteria", "message": "choice needs at least 1 option"}],
+    }}, TypeSafeUnprocessableEntityError, "choice needs", id="criteria"),
+    pytest.param(422, {"detail": [{
+        "loc": ["body", "questions", "criteria"], "msg": "Field required", "type": "missing",
+    }]}, TypeSafeUnprocessableEntityError, "Field required", id="schema"),
+    pytest.param(422, {"error": {
+        "type": "invalid_request_error", "message": 'model: unknown model "jev-latest"',
+    }}, TypeSafeUnprocessableEntityError, "unknown model", id="model"),
+    pytest.param(400, {"detail": {
+        "error_type": "invalid_question", "message": "unknown question id max_tokens_exceeded",
+    }}, TypeSafeBadRequestError, "unknown question", id="marker-in-unrelated-message"),
+    pytest.param(401, {"detail": "Invalid API key"}, TypeSafeAuthenticationError,
+                 "Invalid API key", id="auth"),
+    pytest.param(200, {"model": "jev-test", "usage": {}, "answers": {}}, KeyError, "refers_to_removed",
+                 id="missing-answer"),
+    pytest.param(200, {"model": "jev-test", "usage": {}, "answers": []},
+                 TypeSafeAPIResponseValidationError, "Invalid response data", id="invalid-response"),
+])
+def test_non_size_provider_failures_propagate(
+    sample_repo: Path, tmp_path: Path, status: int, body: dict, error_type: type, message: str
+) -> None:
+    requests = []
+
+    def reject(request):
+        requests.append(request)
+        return httpx2.Response(status, json=body)
+
+    out = tmp_path / "failed-pack"
+    request = ScanRequest.from_dict(
+        {"repo": str(sample_repo), "names": ["old_gate"], "description": "x", "out": str(out)}
+    )
+    with provider_judge(reject) as judge, pytest.raises(error_type, match=message):
+        run_scan(request, judge)
+    assert len(requests) == 1, "unrelated failures must not be retried as input-size failures"
+    assert not (out / "report.json").exists(), "a provider failure must not become a successful report"
+
+
+@pytest.mark.parametrize(("transport_error", "sdk_error"), [
+    pytest.param(httpx2.ConnectError, TypeSafeAPIConnectionError, id="connection"),
+    pytest.param(httpx2.ReadTimeout, TypeSafeAPITimeoutError, id="timeout"),
+])
+def test_transport_failures_propagate(sample_repo: Path, transport_error: type, sdk_error: type) -> None:
+    requests = []
+
+    def fail(request):
+        requests.append(request)
+        raise transport_error("offline transport failure", request=request)
+
+    request = ScanRequest.from_dict(
+        {"repo": str(sample_repo), "names": ["old_gate"], "description": "x"}
+    )
+    with provider_judge(fail) as judge, pytest.raises(sdk_error):
+        run_scan(request, judge)
+    assert len(requests) == 1
 
 
 def test_ordinary_runs_keep_the_unchanged_transport_shape(sample_repo: Path) -> None:
@@ -344,14 +462,22 @@ def test_ordinary_runs_keep_the_unchanged_transport_shape(sample_repo: Path) -> 
     # before the fix -- check_each dispatched over the whole list, every candidate answered,
     # no budget failures, unchanged request shapes (verified against the pre-fix code).
     from jev_remnants.collect import collect_candidates
+    from jev_remnants.questions import LEADS_RECREATION, REFERS_REMOVED
 
-    client = ScriptedJevClient(nouls={"refers_to_removed": 0.9, "leads_agent_to_recreate": 0.9})
+    gateway = BudgetGateway(400, {"detail": {"error_type": "max_tokens_exceeded"}})
     request = ScanRequest.from_dict(
         {"repo": str(sample_repo), "names": ["old_gate"], "description": "x"}
     )
-    report = run_scan(request, Judge(client, thresholds=Thresholds(noul_yes_at=0.8, noul_no_at=0.2)))
+    with provider_judge(gateway) as judge:
+        report = run_scan(request, judge)
     candidates, remainder = collect_candidates(sample_repo, ("old_gate",))
+    baseline = BudgetGateway(400, {"detail": {"error_type": "max_tokens_exceeded"}})
+    items = [candidate.state(report["removed"]) for candidate in candidates]
+    with provider_judge(baseline) as judge:
+        judge.check_each(REFERS_REMOVED, items, list_name="items")
+        judge.check_each(LEADS_RECREATION, items, list_name="items")
+    assert gateway.refused == 0
+    assert [r.content for r in gateway.requests] == [r.content for r in baseline.requests]
     assert report["counts"]["total"] == len(candidates)
     assert report["budget"]["not_inspected"] == list(remainder)
     assert all(finding["probabilities"]["refers_to_removed"] is not None for finding in report["findings"])
-
