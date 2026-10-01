@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from jev_navigator.judgments.client import InputBudgetExceededError
 from jev_navigator.judgments.judge import CheckResult, Judge
 from jev_navigator.judgments.questions import Check
 from jev_navigator.judgments.thresholds import NoulVerdict, Thresholds
@@ -74,25 +75,23 @@ _DREX_SIZE_MESSAGES = ("Request too long: the state ", "request body must be at 
 
 
 def _refused_for_size(error: BaseException) -> bool:
-    """Recognize documented Jev and Drex size refusals from the SDK's decoded error body.
+    """Consume JVN's typed size refusal; recognize Drex's documented SDK 422 size messages.
 
-    Status 422 also covers malformed questions and unknown models; an exception's displayed
-    message can omit Jev's error_type. Neither status alone nor an arbitrary substring is proof.
+    JVN owns Jev error decoding. Drex status 422 also covers malformed questions and unknown
+    models, so neither status alone nor an arbitrary substring is proof of an input-size failure.
     """
+    if isinstance(error, InputBudgetExceededError):
+        return True
+    if getattr(error, "status", None) != 422:
+        return False
     body = getattr(error, "body", None)
     if not isinstance(body, dict):
         return False
-    status = getattr(error, "status", None)
-    if status == 400:
-        detail = body.get("detail")
-        return isinstance(detail, dict) and detail.get("error_type") == "max_tokens_exceeded"
-    if status == 422:
-        detail = body.get("error")
-        if not isinstance(detail, dict) or detail.get("type") != "invalid_request_error":
-            return False
-        message = detail.get("message")
-        return isinstance(message, str) and message.startswith(_DREX_SIZE_MESSAGES)
-    return False
+    detail = body.get("error")
+    if not isinstance(detail, dict) or detail.get("type") != "invalid_request_error":
+        return False
+    message = detail.get("message")
+    return isinstance(message, str) and message.startswith(_DREX_SIZE_MESSAGES)
 
 
 def _ask_check(
