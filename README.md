@@ -52,10 +52,21 @@ Question ids carry a wording hash; a reworded question is a new question. Answer
 their exact request hashes; thresholds (default: yes at 0.80, no at 0.20) are per-request overridable
 via the `thresholds` request field or `JEV_NAVIGATOR_NOUL_*` environment variables.
 
+Live scans use JVN's existing batcher. If the provider refuses input that is too large, jvr
+splits the candidate range and asks again, down to single candidates. A candidate that still
+cannot fit appears in `budget.not_inspected` with the provider's reason; its evidence is never
+truncated to make it fit. Recovery can repeat successful requests from the failed range, so an
+oversized run can use more calls than an ordinary run.
+
+Only documented size refusals qualify: Jev's HTTP 400 `detail.error_type=max_tokens_exceeded`,
+or Drex's HTTP 422 `invalid_request_error` messages for state, row or serialized-body limits.
+Other validation errors, missing answers, authentication and transport failures fail the scan
+and make `jvr scan` exit 1. A malformed response never becomes a successful partial report.
+
 ## Install and test
 
 ```sh
-uv sync            # links ../jev-navigator editable and creates the venv
+uv sync            # installs the locked jev-navigator revision and creates the venv
 uv run pytest      # offline; a scripted Jev client answers
 uv tool install -e .  # the jvr command; live scans need TYPESAFE_API_KEY in ~/.config/jvn/env
 ```

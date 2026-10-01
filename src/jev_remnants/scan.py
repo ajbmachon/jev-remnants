@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from jev_navigator.judgments.judge import CheckResult, Judge
+from jev_navigator.judgments.questions import Check
 from jev_navigator.judgments.thresholds import NoulVerdict, Thresholds
 
 from .collect import Candidate, collect_candidates, head_commit
@@ -69,15 +70,73 @@ def removed_state(request: ScanRequest) -> dict:
     return {"names": list(request.names), "description": request.description}
 
 
+_DREX_SIZE_MESSAGES = ("Request too long: the state ", "request body must be at most ")
+
+
+def _refused_for_size(error: BaseException) -> bool:
+    """Recognize documented Jev and Drex size refusals from the SDK's decoded error body.
+
+    Status 422 also covers malformed questions and unknown models; an exception's displayed
+    message can omit Jev's error_type. Neither status alone nor an arbitrary substring is proof.
+    """
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return False
+    status = getattr(error, "status", None)
+    if status == 400:
+        detail = body.get("detail")
+        return isinstance(detail, dict) and detail.get("error_type") == "max_tokens_exceeded"
+    if status == 422:
+        detail = body.get("error")
+        if not isinstance(detail, dict) or detail.get("type") != "invalid_request_error":
+            return False
+        message = detail.get("message")
+        return isinstance(message, str) and message.startswith(_DREX_SIZE_MESSAGES)
+    return False
+
+
+def _ask_check(
+    judge: Judge, check: Check, items: list, list_name: str, thresholds: Thresholds
+) -> tuple[list[CheckResult | None], dict[int, str]]:
+    """Judge every item with one check, in as few provider requests as the provider can fit.
+
+    Batching stays with JVN: each dispatch is one ``check_each`` call whose ``_batches`` still
+    packs as many items per request as the state budget allows; jvr never packs items itself.
+    Only when the provider refuses a dispatch on input size -- its per-request budget is smaller
+    than JVN's state budget, and one oversized state (an uncapped ``attached_code``, say) can
+    exceed both -- is the refused range bisected and re-asked, down to singletons. A singleton
+    that still refuses comes back as ``None`` with its reason: honestly failed, never silently
+    truncated. Any other error propagates -- an auth or connection failure must kill the run
+    outright, not be recovered around.
+    """
+    if not items:
+        return [], {}
+    try:
+        return list(judge.check_each(check, items, list_name=list_name, thresholds=thresholds)), {}
+    except Exception as error:
+        if not _refused_for_size(error):
+            raise
+        failure = f"refused on input size: {type(error).__name__}: {error}"
+    if len(items) == 1:
+        return [None], {0: f"could not fit one request ({failure})"}
+    middle = len(items) // 2
+    left, left_gaps = _ask_check(judge, check, items[:middle], list_name, thresholds)
+    right, right_gaps = _ask_check(judge, check, items[middle:], list_name, thresholds)
+    return left + right, {**left_gaps, **{p + middle: r for p, r in right_gaps.items()}}
+
+
 def judge_candidates(
     judge: Judge, candidates: list[Candidate], removed: dict, thresholds: Thresholds
-) -> dict[str, list[CheckResult]]:
-    """Two independent judgments per candidate, each batched over all candidates. When jvn
-    releases `check_every` (both checks in one fan-out request), this becomes one pass."""
+) -> dict[str, list[CheckResult | None] | dict[int, str]]:
+    """Two independent judgments per candidate, each dispatched in as few requests as the
+    provider can fit (see ``_ask_check``). A check that no request could carry has ``None``
+    in its result slot and its reason in ``unjudged``, so the report lists the candidate under
+    ``budget.not_inspected`` instead of inventing a verdict for it."""
     items = [candidate.state(removed) for candidate in candidates]
-    refers = judge.check_each(REFERS_REMOVED, items, thresholds=thresholds)
-    leads = judge.check_each(LEADS_RECREATION, items, thresholds=thresholds)
-    return {"refers": refers, "leads": leads}
+    refers, refer_gaps = _ask_check(judge, REFERS_REMOVED, items, "items", thresholds)
+    leads, lead_gaps = _ask_check(judge, LEADS_RECREATION, items, "items", thresholds)
+    unjudged = lead_gaps | refer_gaps
+    return {"refers": refers, "leads": leads, "unjudged": unjudged}
 
 
 def decide(refers: NoulVerdict, leads: NoulVerdict, kind: str) -> tuple[str, list[str]]:
@@ -137,14 +196,28 @@ def run_scan(
         }
         return persist_or_replay(request, report)
 
-    judged = judge_candidates(judge, candidates, removed, thresholds) if candidates else {
-        "refers": [], "leads": []
-    }
+    judged = (
+        judge_candidates(judge, candidates, removed, thresholds)
+        if candidates
+        else {"refers": [], "leads": [], "unjudged": {}}
+    )
 
     findings = []
+    not_inspected = list(remainder)
     counts: dict[str, int] = {}
     for index, candidate in enumerate(candidates):
         refers, leads = judged["refers"][index], judged["leads"][index]
+        if refers is None or leads is None:
+            # A state that fitted no request is honestly failed, with its reason, not truncated.
+            not_inspected.append(
+                {
+                    "file": candidate.file,
+                    "line": candidate.line,
+                    "kind": candidate.kind,
+                    "reason": judged["unjudged"].get(index, "could not be judged"),
+                }
+            )
+            continue
         action, reasons = decide(refers.verdict, leads.verdict, candidate.kind)
         counts[action] = counts.get(action, 0) + 1
         findings.append(
@@ -172,7 +245,7 @@ def run_scan(
         "scope_prefixes": list(request.prefixes) or ["(all tracked files)"],
         "budget": {
             "max_candidates": request.max_candidates,
-            "not_inspected": remainder,
+            "not_inspected": not_inspected,
             "calls": judge.calls if judge else None,
             "input_tokens": judge.input_tokens if judge else None,
         },
