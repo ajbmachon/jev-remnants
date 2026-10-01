@@ -58,8 +58,10 @@ cannot fit appears in `budget.not_inspected` with the provider's reason; its evi
 truncated to make it fit. Recovery can repeat successful requests from the failed range, so an
 oversized run can use more calls than an ordinary run.
 
-Only documented size refusals qualify: Jev's HTTP 400 `detail.error_type=max_tokens_exceeded`,
-or Drex's HTTP 422 `invalid_request_error` messages for state, row or serialized-body limits.
+Only documented size refusals qualify. JVN decodes Jev's HTTP 400
+`detail.error_type=max_tokens_exceeded`; jvr consumes its `InputBudgetExceededError`.
+jvr also recognizes Drex's HTTP 422 `invalid_request_error` messages for state, row or
+serialized-body limits.
 Other validation errors, missing answers, authentication and transport failures fail the scan
 and make `jvr scan` exit 1. A malformed response never becomes a successful partial report.
 
